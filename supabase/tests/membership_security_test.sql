@@ -264,7 +264,7 @@ begin
   perform pg_temp.expect_test(35, 'Admin can invite into own workspace', invitation_a is not null);
 
   perform pg_temp.set_test_user(admin_b);
-  update public.invitations set status = 'expired' where id = invitation_a;
+  update public.invitations set status = 'revoked' where id = invitation_a;
   get diagnostics affected = row_count;
   perform pg_temp.expect_test(36, 'Other workspace admin cannot update an invitation', affected = 0);
   delete from public.invitations where id = invitation_a;
@@ -272,10 +272,10 @@ begin
   perform pg_temp.expect_test(36, 'Other workspace admin cannot delete an invitation', affected = 0);
 
   perform pg_temp.set_test_user(admin_a);
-  update public.invitations set status = 'expired' where id = invitation_a and status = 'pending';
+  update public.invitations set status = 'revoked' where id = invitation_a and status = 'pending';
   get diagnostics affected = row_count;
   perform pg_temp.expect_test(36, 'Admin can update an invitation in their own workspace', affected = 1);
-  delete from public.invitations where id = invitation_a and status = 'expired';
+  delete from public.invitations where id = invitation_a and status = 'revoked';
   get diagnostics affected = row_count;
   perform pg_temp.expect_test(36, 'Admin can delete an invitation in their own workspace', affected = 1);
 
