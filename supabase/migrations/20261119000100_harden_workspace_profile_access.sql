@@ -1,4 +1,4 @@
--- Purpose: remove client TRUNCATE privileges and fix recursive profile reads.
+-- Purpose: remove elevated client table privileges and fix recursive profile reads.
 -- Dependencies: the existing users SELECT policy and workspace_members RLS.
 -- "members read members" uses public.is_workspace_member(uuid), whose
 -- SECURITY DEFINER context checks the caller's active membership without
@@ -9,7 +9,10 @@
 
 begin;
 
-revoke truncate on table public.workspaces, public.workspace_members
+-- Client CRUD and existing foreign keys and triggers do not need these grants.
+revoke truncate, trigger, references, maintain
+on table public.users, public.workspaces, public.workspace_members,
+  public.invitations, public.messages
 from anon, authenticated;
 
 alter policy "read self or coworkers" on public.users

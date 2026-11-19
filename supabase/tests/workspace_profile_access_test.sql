@@ -15,7 +15,7 @@ declare
   test_case record;
   visible_profiles uuid[];
   client record;
-  truncate_tables text[];
+  elevated_grants text[];
 begin
   insert into auth.users (id, email) values
     (alice, 'workspace-profile-test-alice@example.com'),
@@ -91,16 +91,18 @@ begin
   for client in
     select * from (values (28, 'anon'), (29, 'authenticated')) as roles(test_number, role_name)
   loop
-    select array_agg(target.table_name order by target.table_name) into truncate_tables
+    select array_agg(format('%s on %s', grant_type.privilege, target.table_name)
+      order by target.table_name, grant_type.privilege) into elevated_grants
     from (values ('public.users'), ('public.workspaces'), ('public.workspace_members'),
       ('public.invitations'), ('public.messages')) as target(table_name)
-    where has_table_privilege(client.role_name, target.table_name, 'TRUNCATE');
+    cross join (values ('TRUNCATE'), ('TRIGGER'), ('REFERENCES'), ('MAINTAIN')) as grant_type(privilege)
+    where has_table_privilege(client.role_name, target.table_name, grant_type.privilege);
 
-    if truncate_tables is not null then
-      raise exception 'FAIL %: % has TRUNCATE on %',
-        client.test_number, client.role_name, truncate_tables;
+    if elevated_grants is not null then
+      raise exception 'FAIL %: % retains %',
+        client.test_number, client.role_name, elevated_grants;
     end if;
-    raise notice 'PASS %: % has no TRUNCATE on the five application tables',
+    raise notice 'PASS %: % has no TRUNCATE, TRIGGER, REFERENCES, or MAINTAIN on the five application tables',
       client.test_number, client.role_name;
   end loop;
 end;
