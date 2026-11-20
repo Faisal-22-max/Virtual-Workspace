@@ -38,11 +38,12 @@ test ! -e supabase/migrations/20261118000000_local_baseline.sql
 [[ "$VW_PROD_REF" =~ ^[a-z0-9]+$ ]]
 test -r "$VW_PROD_CA"
 prod_ro() {
-  PGSSLMODE=verify-full PGSSLROOTCERT="$VW_PROD_CA" PGOPTIONS='-c default_transaction_read_only=on' \
-    psql -X -v ON_ERROR_STOP=1 -P pager=off -h "db.$VW_PROD_REF.supabase.co" \
-    -p 5432 -U postgres -d postgres "$@"
+  PGSSLMODE=verify-full PGSSLROOTCERT="$VW_PROD_CA" \
+    psql -X -q -v ON_ERROR_STOP=1 -P pager=off -h "db.$VW_PROD_REF.supabase.co" \
+    -p 5432 -U postgres -d postgres "$@" \
+    -c 'BEGIN READ ONLY' -f - -c 'ROLLBACK'
 }
-prod_ro -c "select current_database(), current_user, current_setting('transaction_read_only') as read_only"
+prod_ro <<< "select current_database(), current_user, current_setting('transaction_read_only') as read_only;"
 ```
 
 Expected connection result is `postgres | postgres | on`. Confirm the project ref independently in the dashboard.
@@ -210,47 +211,127 @@ order by l.granted, l.relation, l.pid;
 
 Use a low-traffic window for the entire sequence so migration progress, ACL changes and ledger checks stay coordinated. Pause concurrent deployers and reduce invitation and messaging writes before steps 5 and 6. Step 5 can hold `ACCESS EXCLUSIVE` on `invitations` through constraint validation and the non-concurrent unique index build. Step 6 can hold `ACCESS EXCLUSIVE` on `messages` for the default and policy changes. Monitor lock queues, API latency and errors, and database activity in a second read-only session. [PostgreSQL — explicit locking](https://www.postgresql.org/docs/17/explicit-locking.html) · [PostgreSQL — index creation](https://www.postgresql.org/docs/17/sql-createindex.html)
 
-Agree on a conservative lock wait and overall per-step time budget using the staging rehearsal and service latency budget. If the migration client supports session timeouts in the actual connection path, verify the effective `lock_timeout` and `statement_timeout` in the rehearsal before depending on them. With the tracked CLI procedure below, treat the operator's deadline as authoritative unless client timeout propagation has been verified. At the deadline, abort the step. Cancel only the positively identified deployment backend using the approved operations path. Closing the CLI alone does not prove database cancellation. Recheck locks, object state and ledger before retrying. Investigate blockers without terminating application transactions automatically.
+The approved lock wait is 10 seconds. The statement and total transaction budgets are 2 minutes for steps 1–4 and 5 minutes for steps 5–6. PostgreSQL 17 enforces the total budget with `transaction_timeout`, which also covers the history insert. Inspect lock waits in the observer session. At an exceeded budget, timeout, disconnection or validation error, hold the next step and inspect the catalog and ledger. Cancel only the positively identified deployment backend if intervention is required. Keep application sessions running.
 
-## 6. Deployment execution plan
+## 6. Atomic deployment execution
 
-Run this section only during the approved deployment window. Standard Supabase tracking initializes the absent ledger. The first two migrations use replacement definitions and the second has a guard for the existing last-admin trigger. If the ledger or these definitions differ from the audit, reconcile history manually before this sequence. [Supabase — tracking and reconciliation](https://supabase.com/docs/guides/deployment/database-migrations)
+Run this section during the approved deployment window with Supabase CLI **3.2.0** and PostgreSQL 17. CLI creates its standard history table as a separate setup operation when needed. Once setup finishes, CLI applies each transactional file and its history insert in the same transaction. An explicit `COMMIT` in a migration would commit its schema changes before the history insert. The generator removes only the fixed outer `BEGIN;` and `COMMIT;` lines from files 2–6 so CLI owns that boundary. File 1 has no wrapper. A failed first application may therefore leave an empty, CLI-created ledger. Reconcile that state before retrying. [Supabase migration tracking](https://supabase.com/docs/guides/deployment/database-migrations)
 
-Use the rehearsed Supabase CLI **3.2.0** and an isolated local work directory that contains only the cumulative migration prefix. The CLI considers every pending file in that directory. Keeping the already recorded prefix in place allows history comparison while exposing only one additional file per invocation.
+The Git blobs at the approved revision are the source of truth. Use a private work directory outside the repository. The generator verifies each Git blob against the clean checkout, checks the wrapper lines at the audited positions, and reconstructs the original blob from the generated file to prove that the SQL body and other bytes are unchanged. Record the source, body and deployment SHA-256 digests. The CLI ledger records the original versions and names with the generated execution statements, which include the timeout gate.
+
+Each generated file starts with three `SET LOCAL` statements and a guard that checks all three settings in the actual migration transaction. The guard aborts before schema changes if the settings differ. Keep the generated files private and preserve their cumulative prefix so each invocation exposes exactly one pending version. Use the approved local credential handoff for `SUPABASE_DB_PASSWORD` and an authenticated CLI profile. Use verified TLS for the established direct or rehearsed session-pooler path.
 
 ```bash
-: "${VW_CLI:?Set the absolute path to the rehearsed Supabase CLI 3.2.0}"
+: "${VW_CLI:?Set the absolute path to Supabase CLI 3.2.0}"
 test "$("$VW_CLI" --version)" = 3.2.0
+umask 077
 vw_deploy_dir=$(mktemp -d)
 "$VW_CLI" --workdir "$vw_deploy_dir" init
-mkdir -p "$vw_deploy_dir/supabase/migrations"
+mkdir -p "$vw_deploy_dir/supabase/migrations" "$vw_deploy_dir/supabase/.temp"
+printf '%s\n' "$VW_PROD_REF" > "$vw_deploy_dir/supabase/.temp/project-ref"
+
+normalize_step() {
+  python3 - "$release" "$1" "$2" <<'PYGEN'
+from hashlib import sha256
+from pathlib import Path
+import subprocess
+import sys
+
+release, index, destination = sys.argv[1:]
+index = int(index)
+audited = (
+    ("20261118000100_membership_security.sql", 0, 0),
+    ("20261118000200_protect_last_admin.sql", 6, 93),
+    ("20261119000100_harden_workspace_profile_access.sql", 10, 29),
+    ("20261119000200_protect_invitation_attribution.sql", 2, 38),
+    ("20261119000300_secure_invitation_acceptance.sql", 1, 159),
+    ("20261119000400_harden_message_ownership.sql", 1, 47),
+)
+if not 1 <= index <= len(audited):
+    raise SystemExit("STOP: unknown migration index")
+name, first, last = audited[index - 1]
+source = Path("supabase/migrations") / name
+raw = subprocess.check_output(["git", "show", f"{release}:{source}"])
+if source.read_bytes() != raw:
+    raise SystemExit("STOP: working-tree bytes differ from Git")
+original = raw.splitlines(keepends=True)
+body_lines = original.copy()
+if first:
+    if original[first - 1].strip().lower() != b"begin;" or original[last - 1].strip().lower() != b"commit;":
+        raise SystemExit("STOP: outer transaction markers differ")
+    del body_lines[last - 1]
+    del body_lines[first - 1]
+body = b"".join(body_lines)
+minutes = 2 if index <= 4 else 5
+prefix = f"""set local lock_timeout = '10s';
+set local statement_timeout = '{minutes}min';
+set local transaction_timeout = '{minutes}min';
+do $vw_timeout_gate$
+begin
+  if current_setting('lock_timeout')::interval <> interval '10 seconds'
+     or current_setting('statement_timeout')::interval <> interval '{minutes} minutes'
+     or current_setting('transaction_timeout')::interval <> interval '{minutes} minutes' then
+    raise exception 'Migration timeouts are not effective in this transaction';
+  end if;
+end;
+$vw_timeout_gate$;
+""".encode("ascii")
+target = Path(destination) / name
+with target.open("xb") as output:
+    output.write(prefix + body)
+generated = target.read_bytes()
+if generated[:len(prefix)] != prefix or generated[len(prefix):] != body:
+    raise SystemExit("STOP: generated SQL or timeout preamble differs")
+reconstructed = generated[len(prefix):].splitlines(keepends=True)
+if first:
+    reconstructed.insert(first - 1, original[first - 1])
+    reconstructed.insert(last - 1, original[last - 1])
+if b"".join(reconstructed) != raw:
+    raise SystemExit("STOP: exact reconstruction of the source failed")
+print(f"{name} source={sha256(raw).hexdigest()} body={sha256(body).hexdigest()}"
+      f" deployment={sha256(generated).hexdigest()}")
+PYGEN
+}
+
+vw_audited_dir=$(mktemp -d "$vw_deploy_dir/audited.XXXXXX")
+for index in {1..6}; do
+  normalize_step "$index" "$vw_audited_dir"
+done
 
 apply_step() {
-  local step="$1" file version have previous expected answer prefix_file
+  local step="$1" file version have previous expected answer prefix_file index
   [[ "$step" =~ ^[1-6]$ ]] || return 1
   file="${migrations[step-1]}"
   version="${file%%_*}"
-  have=$(prod_ro -Atc "select to_regclass('supabase_migrations.schema_migrations') is not null") || return 1
+  have=$(prod_ro -At <<< "select to_regclass('supabase_migrations.schema_migrations') is not null;") || return 1
   if [[ "$step" = 1 ]]; then
     [[ "$have" = f ]] || { echo 'STOP: expected absent ledger before step 1'; return 1; }
   else
     [[ "$have" = t ]] || return 1
-    previous=$(prod_ro -Atc 'select version from supabase_migrations.schema_migrations order by version') || return 1
+    previous=$(prod_ro -At <<< 'select version from supabase_migrations.schema_migrations order by version;') || return 1
     expected=$(printf '%s\n' "${migrations[@]:0:step-1}" | cut -d_ -f1)
     [[ "$previous" = "$expected" ]] || { echo 'STOP: ledger does not match approved prefix'; return 1; }
   fi
-  cp "supabase/migrations/$file" "$vw_deploy_dir/supabase/migrations/$file" || return 1
+  local verified
+  verified=$(mktemp -d "$vw_deploy_dir/verify.XXXXXX") || return 1
+  for ((index=1; index<=step; index++)); do
+    normalize_step "$index" "$verified" || return 1
+    prefix_file="${migrations[index-1]}"
+    cmp "$verified/$prefix_file" "$vw_audited_dir/$prefix_file" || return 1
+  done
+  cp "$verified/$file" "$vw_deploy_dir/supabase/migrations/$file" || return 1
   diff -u <(printf '%s\n' "${migrations[@]:0:step}") \
     <(cd "$vw_deploy_dir/supabase/migrations" && printf '%s\n' *.sql | LC_ALL=C sort) || return 1
   for prefix_file in "${migrations[@]:0:step}"; do
-    git show "$release:supabase/migrations/$prefix_file" |
-      cmp - "$vw_deploy_dir/supabase/migrations/$prefix_file" || return 1
+    cmp "$verified/$prefix_file" "$vw_deploy_dir/supabase/migrations/$prefix_file" || return 1
   done
   printf 'Confirm Production ref %s and migration %s by typing the migration version: ' "$VW_PROD_REF" "$file"
   read -r answer
-  [[ "$answer" = "$version" ]] || return 1
-  "$VW_CLI" --workdir "$vw_deploy_dir" migration up --remote="$VW_PROD_REF" --yes || return 1
-  have=$(prod_ro -Atc 'select version from supabase_migrations.schema_migrations order by version') || return 1
+  [[ "$answer" = "$version" && -n "${SUPABASE_DB_PASSWORD:-}" ]] || return 1
+  test "$(cat "$vw_deploy_dir/supabase/.temp/project-ref")" = "$VW_PROD_REF" || return 1
+  PGSSLMODE=verify-full PGSSLROOTCERT="$VW_PROD_CA" \
+    "$VW_CLI" --workdir "$vw_deploy_dir" migration up --remote="$VW_PROD_REF" --yes || return 1
+  have=$(prod_ro -At <<< 'select version from supabase_migrations.schema_migrations order by version;') || return 1
   expected=$(printf '%s\n' "${migrations[@]:0:step}" | cut -d_ -f1)
   [[ "$have" = "$expected" ]] || { echo 'STOP: ledger does not match applied prefix'; return 1; }
 }
@@ -343,7 +424,7 @@ select public.is_workspace_member(null::uuid), public.is_workspace_admin(null::u
 
 ## 8. Rollback and recovery
 
-A failure before commit normally rolls back the active transaction. A lost connection or failed history write can leave committed schema changes without a matching entry. Check both the catalog and ledger before retrying. Stop at the first failed gate, freeze subsequent changes and classify the failed step as unapplied, applied, or partial based on evidence. Record the error and verify against the saved catalog. Keep schema and migration history synchronized through an approved correction. Prefer a forward fix that preserves security controls.
+The CLI-owned migration transaction rolls back schema changes and its history insert together if either fails or the server ends the transaction. History-table initialization may commit separately. A lost connection can hide the final commit result, so check both the catalog and ledger before retrying. Stop at the first failed gate, freeze subsequent changes and classify the failed step as unapplied, applied, or partial based on evidence. Record the error and verify against the saved catalog. Keep schema and migration history synchronized through an approved correction. Prefer a forward fix that preserves security controls.
 
 | Migration | Safe recovery and cautions |
 |---|---|
